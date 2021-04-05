@@ -10,8 +10,9 @@ use crate::{
     boundary::{BoundaryGenerator, RandomAsciiGenerator},
     error::Error,
 };
-use bytes::{BufMut, BytesMut};
+use bytes::{buf::Writer, BufMut, BytesMut};
 use futures::{
+    io::{AllowStdIo, AsyncRead},
     stream::Stream,
     task::{Context, Poll},
 };
@@ -22,6 +23,7 @@ use http::{
 };
 use mime::{self, Mime};
 use std::{
+    borrow::BorrowMut,
     fmt::Display,
     fs::File,
     io::{self, Cursor, Read, Write},
@@ -34,25 +36,16 @@ use std::{
 static CONTENT_DISPOSITION: HeaderName = header::CONTENT_DISPOSITION;
 static CONTENT_TYPE: HeaderName = header::CONTENT_TYPE;
 
-/// Writes a CLRF.
-///
-fn write_crlf<W>(write: &mut W) -> io::Result<()>
-where
-    W: Write,
-{
-    write.write_all(&[b'\r', b'\n'])
-}
-
 /// Async streamable Multipart body.
 ///
 pub struct Body<'a> {
     /// The amount of data to write with each chunk.
     ///
-    buf_size: usize,
+    writer: Writer<BytesMut>,
 
     /// The active reader.
     ///
-    current: Option<Box<dyn 'a + Read + Send + Sync>>,
+    current: Option<Box<dyn 'a + AsyncRead + Send + Sync + Unpin>>,
 
     /// The parts as an iterator. When the iterator stops
     /// yielding, the body is fully written.
@@ -65,47 +58,44 @@ pub struct Body<'a> {
 }
 
 impl<'a> Body<'a> {
+    /// Writes a CLRF.
+    ///
+    fn write_crlf(&mut self) -> io::Result<()> {
+        self.writer.write_all(&[b'\r', b'\n'])
+    }
+
     /// Implements section 4.1.
     ///
     /// [See](https://tools.ietf.org/html/rfc7578#section-4.1).
     ///
-    fn write_boundary<W>(&self, write: &mut W) -> io::Result<()>
-    where
-        W: Write,
-    {
-        write_crlf(write)?;
-        write.write_all(&[b'-', b'-'])?;
-        write.write_all(self.boundary.as_bytes())
+    fn write_boundary(&mut self) -> io::Result<()> {
+        self.write_crlf()?;
+        self.writer.write_all(&[b'-', b'-'])?;
+        self.writer.write_all(self.boundary.as_bytes())
     }
 
     /// Writes the last form boundary.
     ///
     /// [See](https://tools.ietf.org/html/rfc2046#section-5.1).
     ///
-    fn write_final_boundary<W>(&self, write: &mut W) -> io::Result<()>
-    where
-        W: Write,
-    {
-        self.write_boundary(write)?;
-        write.write_all(&[b'-', b'-'])
+    fn write_final_boundary(&mut self) -> io::Result<()> {
+        self.write_boundary()?;
+        self.writer.write_all(&[b'-', b'-'])
     }
 
     /// Writes the Content-Disposition, and Content-Type headers.
     ///
-    fn write_headers<W>(&self, write: &mut W, part: &Part) -> io::Result<()>
-    where
-        W: Write,
-    {
-        write_crlf(write)?;
-        write.write_all(CONTENT_TYPE.as_ref())?;
-        write.write_all(b": ")?;
-        write.write_all(part.content_type.as_bytes())?;
-        write_crlf(write)?;
-        write.write_all(CONTENT_DISPOSITION.as_ref())?;
-        write.write_all(b": ")?;
-        write.write_all(part.content_disposition.as_bytes())?;
-        write_crlf(write)?;
-        write_crlf(write)
+    fn write_headers(&mut self, part: &Part) -> io::Result<()> {
+        self.write_crlf()?;
+        self.writer.write_all(CONTENT_TYPE.as_ref())?;
+        self.writer.write_all(b": ")?;
+        self.writer.write_all(part.content_type.as_bytes())?;
+        self.write_crlf()?;
+        self.writer.write_all(CONTENT_DISPOSITION.as_ref())?;
+        self.writer.write_all(b": ")?;
+        self.writer.write_all(part.content_disposition.as_bytes())?;
+        self.write_crlf()?;
+        self.write_crlf()
     }
 }
 
@@ -114,56 +104,66 @@ impl<'a> Stream for Body<'a> {
 
     /// Iterate over each form part, and write it out.
     ///
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let bytes = BytesMut::with_capacity(self.buf_size);
-        let mut writer = bytes.writer();
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let body = self.get_mut();
 
-        if self.current.is_none() {
-            if let Some(part) = self.parts.next() {
-                self.write_boundary(&mut writer)
-                    .map_err(Error::BoundaryWrite)?;
-                self.write_headers(&mut writer, &part)
-                    .map_err(Error::HeaderWrite)?;
+        match body.current {
+            None => {
+                if let Some(part) = body.parts.next() {
+                    body.write_boundary().map_err(Error::BoundaryWrite)?;
+                    body.write_headers(&part).map_err(Error::HeaderWrite)?;
 
-                let read = match part.inner {
-                    Inner::Read(read, _) => read,
-                    Inner::Text(s) => Box::new(Cursor::new(s.into_bytes())),
-                };
+                    let read: Box<dyn AsyncRead + Send + Sync + Unpin> = match part.inner {
+                        Inner::Read(read, _) => Box::new(AllowStdIo::new(read)),
+                        Inner::AsyncRead(read) => read,
+                        Inner::Text(s) => Box::new(AllowStdIo::new(Cursor::new(s))),
+                    };
 
-                self.current = Some(read);
-            } else {
-                // No current part, and no parts left means there is nothing
-                // left to write.
-                //
-                return Poll::Ready(None);
+                    body.current = Some(read);
+
+                    cx.waker().wake_by_ref();
+
+                    Poll::Pending
+                } else {
+                    body.write_final_boundary().map_err(Error::BoundaryWrite)?;
+
+                    // No current part, and no parts left means there is nothing
+                    // left to write.
+                    //
+                    Poll::Ready(None)
+                }
             }
-        }
+            Some(ref mut read) => {
+                match AsyncRead::poll_read(Pin::new(read), cx, body.writer.get_mut().borrow_mut()) {
+                    // EOF: No data left to read. Get ready to move onto write the next part.
+                    //
+                    Poll::Ready(Ok(0)) => {
+                        body.current = None;
 
-        let num = if let Some(ref mut read) = self.current {
-            io::copy(read, &mut writer).map_err(Error::ContentRead)?
-        } else {
-            0
-        };
+                        cx.waker().wake_by_ref();
 
-        if num == 0 {
-            // Wrote 0 bytes from the reader, so we reached the EOF for the
-            // current item.
-            //
-            self.current = None;
+                        Poll::Pending
+                    }
+                    // Read some data.
+                    //
+                    Poll::Ready(Ok(bytes_read)) => {
+                        // We're writing directly to the output buffer, and only advancing the buffer
+                        // the amount that was written. This *should* be safe.
+                        //
+                        unsafe {
+                            body.writer.get_mut().advance_mut(bytes_read);
+                        }
 
-            // Peek to check if there are are any parts not yet written.
-            // If there is nothing, the final boundary can be written.
-            //
-            if self.parts.peek().is_none() {
-                self.write_final_boundary(&mut writer)
-                    .map_err(Error::BoundaryWrite)?;
-
-                Poll::Ready(Some(Ok(writer.into_inner())))
-            } else {
-                self.poll_next(cx)
+                        Poll::Ready(Some(Ok(body.writer.get_mut().split())))
+                    }
+                    // Underlying stream isn't ready to be read from yet.
+                    //
+                    Poll::Pending => Poll::Pending,
+                    // Error reading from underlying stream.
+                    //
+                    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Error::ContentRead(e)))),
+                }
             }
-        } else {
-            Poll::Ready(Some(Ok(writer.into_inner())))
         }
     }
 }
@@ -268,12 +268,41 @@ impl<'a> Form<'a> {
     pub fn add_reader<F, R>(&mut self, name: F, read: R)
     where
         F: Display,
-        R: 'a + Read + Send + Sync,
+        R: 'a + Read + Send + Sync + Unpin,
     {
         let read = Box::new(read);
 
         self.parts.push(Part::new::<_, String>(
             Inner::Read(read, None),
+            name,
+            None,
+            None,
+        ));
+    }
+
+    /// Adds a readable part to the Form.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use futures::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_async_reader("input", bytes);
+    /// ```
+    ///
+    pub fn add_async_reader<F, R>(&mut self, name: F, read: R)
+    where
+        F: Display,
+        R: 'a + AsyncRead + Send + Sync + Unpin,
+    {
+        let read = Box::new(read);
+
+        self.parts.push(Part::new::<_, String>(
+            Inner::AsyncRead(read),
             name,
             None,
             None,
@@ -292,73 +321,12 @@ impl<'a> Form<'a> {
     /// form.add_file("file", file!()).expect("file to exist");
     /// ```
     ///
-    #[inline]
     pub fn add_file<P, F>(&mut self, name: F, path: P) -> io::Result<()>
     where
         P: AsRef<Path>,
         F: Display,
     {
         self._add_file(name, path, None)
-    }
-
-    /// Adds a readable part to the Form as a file.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use common_multipart_rfc7578::client::multipart;
-    /// use std::io::Cursor;
-    ///
-    /// let bytes = Cursor::new("Hello World!");
-    /// let mut form = multipart::Form::default();
-    ///
-    /// form.add_reader_file("input", bytes, "filename.txt");
-    /// ```
-    ///
-    pub fn add_reader_file<F, G, R>(&mut self, name: F, read: R, filename: G)
-    where
-        F: Display,
-        G: Into<String>,
-        R: 'a + Read + Send + Sync,
-    {
-        let read = Box::new(read);
-
-        self.parts.push(Part::new::<_, String>(
-            Inner::Read(read, None),
-            name,
-            None,
-            Some(filename.into()),
-        ));
-    }
-
-    /// Adds a readable part to the Form as a file with a specified mime.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use common_multipart_rfc7578::client::multipart;
-    /// use std::io::Cursor;
-    ///
-    /// let bytes = Cursor::new("Hello World!");
-    /// let mut form = multipart::Form::default();
-    ///
-    /// form.add_reader_file_with_mime("input", bytes, "filename.txt", mime::TEXT_PLAIN);
-    /// ```
-    ///
-    pub fn add_reader_file_with_mime<F, G, R>(&mut self, name: F, read: R, filename: G, mime: Mime)
-    where
-        F: Display,
-        G: Into<String>,
-        R: 'a + Read + Send + Sync,
-    {
-        let read = Box::new(read);
-
-        self.parts.push(Part::new::<_, String>(
-            Inner::Read(read, None),
-            name,
-            Some(mime),
-            Some(filename.into()),
-        ));
     }
 
     /// Adds a file with the specified mime type to the form.
@@ -375,7 +343,6 @@ impl<'a> Form<'a> {
     /// form.add_file_with_mime("data", "test.csv", mime::TEXT_CSV);
     /// ```
     ///
-    #[inline]
     pub fn add_file_with_mime<P, F>(&mut self, name: F, path: P, mime: Mime) -> io::Result<()>
     where
         P: AsRef<Path>,
@@ -426,6 +393,131 @@ impl<'a> Form<'a> {
         Ok(())
     }
 
+    /// Adds a readable part to the Form as a file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use std::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_reader_file("input", bytes, "filename.txt");
+    /// ```
+    ///
+    pub fn add_reader_file<F, G, R>(&mut self, name: F, read: R, filename: G)
+    where
+        F: Display,
+        G: Into<String>,
+        R: 'a + Read + Send + Sync + Unpin,
+    {
+        let read = Box::new(read);
+
+        self.parts.push(Part::new::<_, String>(
+            Inner::Read(read, None),
+            name,
+            None,
+            Some(filename.into()),
+        ));
+    }
+
+    /// Adds a readable part to the Form as a file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use futures::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_async_reader_file("input", bytes, "filename.txt");
+    /// ```
+    ///
+    pub fn add_async_reader_file<F, G, R>(&mut self, name: F, read: R, filename: G)
+    where
+        F: Display,
+        G: Into<String>,
+        R: 'a + AsyncRead + Send + Sync + Unpin,
+    {
+        let read = Box::new(read);
+
+        self.parts.push(Part::new::<_, String>(
+            Inner::AsyncRead(read),
+            name,
+            None,
+            Some(filename.into()),
+        ));
+    }
+
+    /// Adds a readable part to the Form as a file with a specified mime.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use std::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_reader_file_with_mime("input", bytes, "filename.txt", mime::TEXT_PLAIN);
+    /// ```
+    ///
+    pub fn add_reader_file_with_mime<F, G, R>(&mut self, name: F, read: R, filename: G, mime: Mime)
+    where
+        F: Display,
+        G: Into<String>,
+        R: 'a + Read + Send + Sync + Unpin,
+    {
+        let read = Box::new(read);
+
+        self.parts.push(Part::new::<_, String>(
+            Inner::Read(read, None),
+            name,
+            Some(mime),
+            Some(filename.into()),
+        ));
+    }
+
+    /// Adds a readable part to the Form as a file with a specified mime.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common_multipart_rfc7578::client::multipart;
+    /// use futures::io::Cursor;
+    ///
+    /// let bytes = Cursor::new("Hello World!");
+    /// let mut form = multipart::Form::default();
+    ///
+    /// form.add_async_reader_file_with_mime("input", bytes, "filename.txt", mime::TEXT_PLAIN);
+    /// ```
+    ///
+    pub fn add_async_reader_file_with_mime<F, G, R>(
+        &mut self,
+        name: F,
+        read: R,
+        filename: G,
+        mime: Mime,
+    ) where
+        F: Display,
+        G: Into<String>,
+        R: 'a + AsyncRead + Send + Sync + Unpin,
+    {
+        let read = Box::new(read);
+
+        self.parts.push(Part::new::<_, String>(
+            Inner::AsyncRead(read),
+            name,
+            Some(mime),
+            Some(filename.into()),
+        ));
+    }
+
     /// Updates a request instance with the multipart Content-Type header
     /// and the payload data.
     ///
@@ -442,7 +534,6 @@ impl<'a> Form<'a> {
     /// let req = form.set_body::<multipart::Body>(req_builder).unwrap();
     /// ```
     ///
-    #[inline]
     pub fn set_body<B>(self, req: Builder) -> Result<Request<B>, http::Error>
     where
         B: From<Body<'a>>,
@@ -484,10 +575,9 @@ impl<'a> Form<'a> {
 impl<'a> From<Form<'a>> for Body<'a> {
     /// Turns a `Form` into a multipart `Body`.
     ///
-    #[inline]
     fn from(form: Form<'a>) -> Self {
         Body {
-            buf_size: 2048,
+            writer: BytesMut::with_capacity(2048).writer(),
             current: None,
             parts: form.parts.into_iter().peekable(),
             boundary: form.boundary,
@@ -557,7 +647,7 @@ impl<'a> Part<'a> {
 }
 
 enum Inner<'a> {
-    /// The `Read` variant captures multiple cases.
+    /// The `Read` and `AsyncRead` variants captures multiple cases.
     ///
     ///   * The first is it supports uploading a file, which is explicitly
     ///     described in RFC 7578.
@@ -568,7 +658,9 @@ enum Inner<'a> {
     ///     and assigned the corresponding content type if not explicitly
     ///     specified.
     ///
-    Read(Box<dyn 'a + Read + Send + Sync>, Option<u64>),
+    Read(Box<dyn 'a + Read + Send + Sync + Unpin>, Option<u64>),
+
+    AsyncRead(Box<dyn 'a + AsyncRead + Send + Sync + Unpin>),
 
     /// The `String` variant handles "text/plain" form data payloads.
     ///
@@ -580,10 +672,9 @@ impl<'a> Inner<'a> {
     ///
     /// [See](https://tools.ietf.org/html/rfc7578#section-4.4)
     ///
-    #[inline]
     fn default_content_type(&self) -> Mime {
         match *self {
-            Inner::Read(_, _) => mime::APPLICATION_OCTET_STREAM,
+            Inner::Read(_, _) | Inner::AsyncRead(_) => mime::APPLICATION_OCTET_STREAM,
             Inner::Text(_) => mime::TEXT_PLAIN,
         }
     }
